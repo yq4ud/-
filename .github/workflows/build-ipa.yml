@@ -1,0 +1,1149 @@
+name: Build Unsigned IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clean & Generate All Project Files
+        run: |
+          rm -rf Shared AsahiBusNavi AsahiBusWidget AsahiBusNavi.xcodeproj build project.yml
+          mkdir -p Shared AsahiBusNavi
+
+          cat << 'EOF' > project.yml
+          name: AsahiBusNavi
+          options:
+            bundleIdPrefix: com.yq4uz
+            deploymentTarget:
+              iOS: "17.0"
+
+          settings:
+            base:
+              SWIFT_VERSION: "5.9"
+              CODE_SIGNING_ALLOWED: "NO"
+              CODE_SIGNING_REQUIRED: "NO"
+              CODE_SIGN_IDENTITY: ""
+              DEVELOPMENT_TEAM: ""
+              ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+              GENERATE_INFOPLIST_FILE: "NO"
+
+          targets:
+            AsahiBusNavi:
+              type: application
+              platform: iOS
+              sources:
+                - path: AsahiBusNavi
+                - path: Shared
+              info:
+                path: AsahiBusNavi/Info.plist
+          EOF
+
+          cat << 'EOF' > AsahiBusNavi/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>ja</string>
+              <key>CFBundleDisplayName</key>
+              <string>朝日バスナビ</string>
+              <key>CFBundleExecutable</key>
+              <string>AsahiBusNavi</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.yq4uz.AsahiBusNavi</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>AsahiBusNavi</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>UILaunchScreen</key>
+              <dict/>
+              <key>UIBackgroundModes</key>
+              <array>
+                  <string>fetch</string>
+              </array>
+              <key>BGTaskSchedulerPermittedIdentifiers</key>
+              <array>
+                  <string>com.yq4uz.AsahiBusNavi.refresh</string>
+              </array>
+          </dict>
+          </plist>
+          EOF
+
+          cat << 'EOF' > Shared/BusModels.swift
+          import Foundation
+
+          struct BusAPIResponse: Codable {
+              let status: String
+              let stopName: String
+              let from: String
+              let to: String
+              let selectedDir: String
+              let directions: [String]
+              let scheduledTime: String
+              let predictedTime: String
+              let delayMinutes: Int
+              let stopsAwayText: String
+              let nextBus: BusItem
+              let buses: [BusItem]
+              let detailUrl: String
+              let timetableUrl: String?
+              let naviUrl: String
+              let fetchedAt: String
+          }
+
+          struct BusItem: Codable, Identifiable {
+              var id: String { "\(source)-\(scheduledTime)-\(predictedTime)" }
+              let source: String
+              let scheduledTime: String
+              let predictedTime: String
+              let delayMinutes: Int
+              let stopsAwayText: String
+
+              var isLive: Bool { source == "live" }
+              var isDelayed: Bool { delayMinutes > 0 }
+
+              func targetDate(now: Date = Date()) -> Date? {
+                  let parts = predictedTime.split(separator: ":").compactMap { Int($0) }
+                  guard parts.count == 2 else { return nil }
+                  let cal = Calendar.current
+                  var comps = cal.dateComponents([.year, .month, .day], from: now)
+                  comps.hour = parts[0]
+                  comps.minute = parts[1]
+                  comps.second = 0
+                  guard var target = cal.date(from: comps) else { return nil }
+                  if target < now.addingTimeInterval(-12 * 3600) {
+                      target = cal.date(byAdding: .day, value: 1, to: target) ?? target
+                  }
+                  return target > now ? target : nil
+              }
+          }
+
+          struct FavoriteRoute: Codable, Identifiable, Equatable {
+              var id: String { "\(from)|\(to)|\(dir)" }
+              let from: String
+              let to: String
+              let dir: String
+              var notifyMinutes: Int
+
+              init(from: String, to: String, dir: String, notifyMinutes: Int = 5) {
+                  self.from = from
+                  self.to = to
+                  self.dir = dir
+                  self.notifyMinutes = notifyMinutes
+              }
+
+              init(from decoder: Decoder) throws {
+                  let container = try decoder.container(keyedBy: CodingKeys.self)
+                  self.from = try container.decode(String.self, forKey: .from)
+                  self.to = try container.decode(String.self, forKey: .to)
+                  self.dir = try container.decode(String.self, forKey: .dir)
+                  self.notifyMinutes = (try? container.decode(Int.self, forKey: .notifyMinutes)) ?? 5
+              }
+
+              static func == (lhs: FavoriteRoute, rhs: FavoriteRoute) -> Bool {
+                  lhs.from == rhs.from && lhs.to == rhs.to && lhs.dir == rhs.dir
+              }
+          }
+
+          final class RouteStore {
+              static let shared = RouteStore()
+              private let favKey = "saved_favorite_routes_v1"
+              private let smartSortKey = "smart_am_pm_sort_v1"
+
+              private var defaults: UserDefaults { .standard }
+
+              var isSmartSortEnabled: Bool {
+                  get { defaults.bool(forKey: smartSortKey) }
+                  set { defaults.set(newValue, forKey: smartSortKey) }
+              }
+
+              func loadFavorites(applySmartSort: Bool = true) -> [FavoriteRoute] {
+                  var list: [FavoriteRoute]
+                  if let data = defaults.data(forKey: favKey),
+                     let decoded = try? JSONDecoder().decode([FavoriteRoute].self, from: data),
+                     !decoded.isEmpty {
+                      list = decoded
+                  } else {
+                      list = [FavoriteRoute(from: "吉川橋", to: "越谷駅東口", dir: "", notifyMinutes: 5)]
+                  }
+
+                  if applySmartSort && isSmartSortEnabled && list.count >= 2 {
+                      let hour = Calendar.current.component(.hour, from: Date())
+                      if hour >= 12 {
+                          let second = list.remove(at: 1)
+                          list.insert(second, at: 0)
+                      }
+                  }
+                  return list
+              }
+
+              func saveFavorites(_ routes: [FavoriteRoute]) {
+                  if let data = try? JSONEncoder().encode(routes) {
+                      defaults.set(data, forKey: favKey)
+                  }
+              }
+
+              func addFavorite(_ route: FavoriteRoute) {
+                  var list = loadFavorites(applySmartSort: false)
+                  if !list.contains(route) {
+                      list.append(route)
+                      saveFavorites(list)
+                  }
+              }
+
+              func removeFavorite(id: String) {
+                  var list = loadFavorites(applySmartSort: false)
+                  list.removeAll { $0.id == id }
+                  saveFavorites(list)
+              }
+
+              func moveRoute(id: String, direction: Int) {
+                  var list = loadFavorites(applySmartSort: false)
+                  guard let idx = list.firstIndex(where: { $0.id == id }) else { return }
+                  let newIdx = idx + direction
+                  guard list.indices.contains(newIdx) else { return }
+                  let item = list.remove(at: idx)
+                  list.insert(item, at: newIdx)
+                  saveFavorites(list)
+              }
+
+              func cycleNotifyMinutes(id: String) {
+                  var list = loadFavorites(applySmartSort: false)
+                  guard let idx = list.firstIndex(where: { $0.id == id }) else { return }
+                  let options = [3, 5, 10, 15]
+                  let current = list[idx].notifyMinutes
+                  let next = options.first(where: { $0 > current }) ?? options[0]
+                  list[idx].notifyMinutes = next
+                  saveFavorites(list)
+              }
+          }
+          EOF
+
+          cat << 'EOF' > Shared/BusAPIClient.swift
+          import Foundation
+
+          final class BusAPIClient {
+              static let shared = BusAPIClient()
+              private let baseURL = "https://yq4.xsrv.jp/bus.php"
+
+              func fetchBus(from: String, to: String = "", dir: String = "") async throws -> BusAPIResponse {
+                  var components = URLComponents(string: baseURL)!
+                  components.queryItems = [
+                      URLQueryItem(name: "from", value: from),
+                      URLQueryItem(name: "to", value: to),
+                      URLQueryItem(name: "dir", value: dir),
+                      URLQueryItem(name: "_", value: String(Int(Date().timeIntervalSince1970)))
+                  ]
+
+                  guard let url = components.url else {
+                      throw URLError(.badURL)
+                  }
+
+                  var request = URLRequest(url: url)
+                  request.cachePolicy = .reloadIgnoringLocalCacheData
+                  request.timeoutInterval = 12
+
+                  let (data, _) = try await URLSession.shared.data(for: request)
+                  return try JSONDecoder().decode(BusAPIResponse.self, from: data)
+              }
+          }
+          EOF
+
+          cat << 'EOF' > AsahiBusNavi/NotificationManager.swift
+          import Foundation
+          import UserNotifications
+
+          final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
+              static let shared = NotificationManager()
+              private var lastDelayMap: [String: Int] = [:]
+
+              func requestPermission() {
+                  let center = UNUserNotificationCenter.current()
+                  center.delegate = self
+                  center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+              }
+
+              func sendTestNotification() {
+                  requestPermission()
+                  let content = UNMutableNotificationContent()
+                  content.title = "🚌 朝日バスナビ テスト通知"
+                  content.body = "アプリを閉じていても、設定した分数前にこの通知ポップが届きます！"
+                  content.sound = .default
+
+                  let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 2, repeats: false)
+                  let request = UNNotificationRequest(identifier: "test-\(Int(Date().timeIntervalSince1970))", content: content, trigger: trigger)
+                  UNUserNotificationCenter.current().add(request)
+              }
+
+              /// 取得した全路線の直近バスについて、アプリを閉じた後でも鳴るようにiOS通知センターへ事前予約する
+              func scheduleAllUpcomingNotifications(routes: [FavoriteRoute], results: [String: BusAPIResponse], isEnabled: Bool) {
+                  let center = UNUserNotificationCenter.current()
+                  // 既存の予約済み事前通知をリセットして最新の予測時刻で再予約
+                  center.getPendingNotificationRequests { requests in
+                      let oldIds = requests.map(\.identifier).filter { $0.hasPrefix("sched-") }
+                      center.removePendingNotificationRequests(withIdentifiers: oldIds)
+
+                      guard isEnabled else { return }
+                      let now = Date()
+
+                      for route in routes {
+                          guard let data = results[route.id] else { continue }
+
+                          // 1. 遅延が新規発生・悪化した場合は即座に通知ポップ
+                          if let firstBus = data.buses.first {
+                              let prevDelay = self.lastDelayMap[route.id] ?? 0
+                              if firstBus.isLive && firstBus.delayMinutes > 0 && firstBus.delayMinutes > prevDelay {
+                                  self.fireImmediateNotification(
+                                      id: "delay-\(route.id)-\(firstBus.predictedTime)-\(firstBus.delayMinutes)",
+                                      title: "⚠️ バス遅延のお知らせ（+\(firstBus.delayMinutes)分）",
+                                      body: "\(data.stopName)\n予測到着 \(firstBus.predictedTime)（\(firstBus.stopsAwayText)）"
+                                  )
+                              }
+                              self.lastDelayMap[route.id] = firstBus.delayMinutes
+                          }
+
+                          // 2. 直近3本先までのバスについて「設定した◯分前」に鳴る通知を事前予約（アプリを閉じても鳴る）
+                          for bus in data.buses.prefix(3) {
+                              guard let departureDate = bus.targetDate(now: now) else { continue }
+                              let notifyDate = departureDate.addingTimeInterval(-Double(route.notifyMinutes * 60))
+
+                              // 通知予定時刻がまだ未来なら、その時刻でiOSにタイマー予約
+                              if notifyDate > now.addingTimeInterval(3) {
+                                  let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second], from: notifyDate)
+                                  let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
+
+                                  let content = UNMutableNotificationContent()
+                                  content.title = "🚌 あと\(route.notifyMinutes)分でバスが発車します"
+                                  let statusNote = bus.isLive ? "予測 \(bus.predictedTime)（\(bus.stopsAwayText)）" : "定刻 \(bus.predictedTime)"
+                                  content.body = "\(data.stopName) • \(statusNote)"
+                                  content.sound = .default
+
+                                  let reqId = "sched-\(route.id)-\(bus.predictedTime)-\(route.notifyMinutes)"
+                                  let request = UNNotificationRequest(identifier: reqId, content: content, trigger: trigger)
+                                  center.add(request)
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private func fireImmediateNotification(id: String, title: String, body: String) {
+                  let content = UNMutableNotificationContent()
+                  content.title = title
+                  content.body = body
+                  content.sound = .default
+
+                  let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+                  let request = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
+                  UNUserNotificationCenter.current().add(request)
+              }
+
+              func userNotificationCenter(
+                  _ center: UNUserNotificationCenter,
+                  willPresent notification: UNNotification,
+                  withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+              ) {
+                  completionHandler([.banner, .sound])
+              }
+          }
+          EOF
+
+          cat << 'EOF' > AsahiBusNavi/BackgroundRefreshManager.swift
+          import Foundation
+          import BackgroundTasks
+
+          final class BackgroundRefreshManager {
+              static let shared = BackgroundRefreshManager()
+              static let taskIdentifier = "com.yq4uz.AsahiBusNavi.refresh"
+
+              func register() {
+                  BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.taskIdentifier, using: nil) { task in
+                      guard let refreshTask = task as? BGAppRefreshTask else { return }
+                      self.handleAppRefresh(task: refreshTask)
+                  }
+              }
+
+              func scheduleNextRefresh() {
+                  let request = BGAppRefreshTaskRequest(identifier: Self.taskIdentifier)
+                  // 最短5分後にバックグラウンド更新をリクエスト
+                  request.earliestBeginDate = Date(timeIntervalSinceNow: 5 * 60)
+                  try? BGTaskScheduler.shared.submit(request)
+              }
+
+              private func handleAppRefresh(task: BGAppRefreshTask) {
+                  scheduleNextRefresh()
+
+                  let operationTask = Task {
+                      let isNotifyEnabled = UserDefaults.standard.object(forKey: "notifyEnabled") as? Bool ?? true
+                      let routes = RouteStore.shared.loadFavorites()
+                      var fetchedResults: [String: BusAPIResponse] = [:]
+
+                      for route in routes {
+                          if let res = try? await BusAPIClient.shared.fetchBus(from: route.from, to: route.to, dir: route.dir) {
+                              fetchedResults[route.id] = res
+                          }
+                      }
+
+                      if !fetchedResults.isEmpty {
+                          NotificationManager.shared.scheduleAllUpcomingNotifications(
+                              routes: routes,
+                              results: fetchedResults,
+                              isEnabled: isNotifyEnabled
+                          )
+                      }
+                      task.setTaskCompleted(success: !fetchedResults.isEmpty)
+                  }
+
+                  task.expirationHandler = {
+                      operationTask.cancel()
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > AsahiBusNavi/AsahiBusNaviApp.swift
+          import SwiftUI
+
+          @main
+          struct AsahiBusNaviApp: App {
+              @Environment(\.scenePhase) private var scenePhase
+
+              init() {
+                  NotificationManager.shared.requestPermission()
+                  BackgroundRefreshManager.shared.register()
+              }
+
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                          .preferredColorScheme(.dark)
+                  }
+                  .onChange(of: scenePhase) { _, newPhase in
+                      if newPhase == .background {
+                          BackgroundRefreshManager.shared.scheduleNextRefresh()
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > AsahiBusNavi/ContentView.swift
+          import SwiftUI
+          import Combine
+          import UIKit
+
+          struct ContentView: View {
+              @State private var favorites: [FavoriteRoute] = RouteStore.shared.loadFavorites()
+              @State private var results: [String: BusAPIResponse] = [:]
+              @State private var isLoading = false
+              @State private var lastFetched = Date()
+              @State private var now = Date()
+              @State private var hasError = false
+
+              @AppStorage("notifyEnabled") private var notifyEnabled = true
+              @State private var smartSortEnabled = RouteStore.shared.isSmartSortEnabled
+              @State private var keepScreenAwake = false
+
+              @State private var isSearchOpen = false
+              @State private var searchFrom = ""
+              @State private var searchTo = ""
+              @State private var searchResult: BusAPIResponse?
+              @State private var isSearching = false
+
+              private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+              var body: some View {
+                  NavigationStack {
+                      ScrollView {
+                          VStack(spacing: 12) {
+                              headerBar
+                              timeStatusBar
+                              quickControlBar
+
+                              if isSearchOpen {
+                                  searchPanel
+                              }
+
+                              ForEach(Array(favorites.enumerated()), id: \.element.id) { index, fav in
+                                  if let data = results[fav.id] {
+                                      RouteCardView(
+                                          route: fav,
+                                          data: data,
+                                          now: now,
+                                          canMoveUp: index > 0 && !smartSortEnabled,
+                                          canMoveDown: index < favorites.count - 1 && !smartSortEnabled,
+                                          onMoveUp: {
+                                              RouteStore.shared.moveRoute(id: fav.id, direction: -1)
+                                              favorites = RouteStore.shared.loadFavorites()
+                                          },
+                                          onMoveDown: {
+                                              RouteStore.shared.moveRoute(id: fav.id, direction: 1)
+                                              favorites = RouteStore.shared.loadFavorites()
+                                          },
+                                          onCycleNotify: {
+                                              RouteStore.shared.cycleNotifyMinutes(id: fav.id)
+                                              favorites = RouteStore.shared.loadFavorites()
+                                              NotificationManager.shared.scheduleAllUpcomingNotifications(
+                                                  routes: favorites,
+                                                  results: results,
+                                                  isEnabled: notifyEnabled
+                                              )
+                                          },
+                                          actionTitle: "削除",
+                                          actionIsDestructive: true,
+                                          onAction: {
+                                              RouteStore.shared.removeFavorite(id: fav.id)
+                                              favorites = RouteStore.shared.loadFavorites()
+                                              NotificationManager.shared.scheduleAllUpcomingNotifications(
+                                                  routes: favorites,
+                                                  results: results,
+                                                  isEnabled: notifyEnabled
+                                              )
+                                          }
+                                      )
+                                  } else {
+                                      ProgressCardView(title: "\(fav.from) を取得中...")
+                                  }
+                              }
+
+                              Text("閉じた後も通知予約有効 • 下に引っ張って更新 • made by yq4uz")
+                                  .font(.system(size: 10))
+                                  .foregroundColor(.gray)
+                                  .padding(.top, 16)
+                          }
+                          .padding(.horizontal, 14)
+                          .padding(.bottom, 40)
+                      }
+                      .refreshable {
+                          await reloadAll()
+                      }
+                      .background(Color.black.ignoresSafeArea())
+                      .navigationBarHidden(true)
+                  }
+                  .task {
+                      await reloadAll()
+                  }
+                  .onDisappear {
+                      UIApplication.shared.isIdleTimerDisabled = false
+                  }
+                  .onReceive(timer) { input in
+                      now = input
+                      if Int(now.timeIntervalSince(lastFetched)) >= 60 && !isLoading {
+                          Task { await reloadAll() }
+                      }
+                  }
+              }
+
+              private var headerBar: some View {
+                  HStack(spacing: 8) {
+                      Text("朝日バスナビ")
+                          .font(.system(size: 22, weight: .heavy, design: .rounded))
+                          .foregroundColor(.white)
+                          .lineLimit(1)
+                          .fixedSize(horizontal: true, vertical: false)
+
+                      Spacer()
+
+                      Button {
+                          notifyEnabled.toggle()
+                          if notifyEnabled {
+                              NotificationManager.shared.requestPermission()
+                          }
+                          NotificationManager.shared.scheduleAllUpcomingNotifications(
+                              routes: favorites,
+                              results: results,
+                              isEnabled: notifyEnabled
+                          )
+                      } label: {
+                          Image(systemName: notifyEnabled ? "bell.fill" : "bell.slash")
+                              .font(.system(size: 13, weight: .bold))
+                              .foregroundColor(notifyEnabled ? .yellow : .gray)
+                              .frame(width: 32, height: 32)
+                              .background(Color(white: 0.16))
+                              .clipShape(Circle())
+                      }
+
+                      Button {
+                          Task { await reloadAll() }
+                      } label: {
+                          Image(systemName: "arrow.clockwise")
+                              .font(.system(size: 13, weight: .bold))
+                              .foregroundColor(.blue)
+                              .frame(width: 32, height: 32)
+                              .background(Color.blue.opacity(0.2))
+                              .clipShape(Circle())
+                      }
+
+                      Button {
+                          withAnimation { isSearchOpen.toggle() }
+                      } label: {
+                          Text(isSearchOpen ? "×" : "＋追加")
+                              .font(.system(size: 12, weight: .bold))
+                              .lineLimit(1)
+                              .fixedSize(horizontal: true, vertical: false)
+                              .padding(.horizontal, 11)
+                              .padding(.vertical, 7)
+                              .background(Color.blue)
+                              .foregroundColor(.white)
+                              .clipShape(Capsule())
+                      }
+                  }
+                  .padding(.top, 8)
+              }
+
+              private var timeStatusBar: some View {
+                  let elapsedSec = max(0, Int(now.timeIntervalSince(lastFetched)))
+                  let isStale = hasError || elapsedSec >= 75
+
+                  return HStack(spacing: 6) {
+                      Text("現在 \(formatTimeHMS(now))")
+                          .font(.system(size: 12, weight: .bold))
+                          .foregroundColor(.white)
+                          .monospacedDigit()
+                          .lineLimit(1)
+                          .fixedSize(horizontal: true, vertical: false)
+
+                      Spacer()
+
+                      if isLoading {
+                          Text("↻ 更新中...")
+                              .font(.system(size: 11, weight: .bold))
+                              .foregroundColor(.blue)
+                              .lineLimit(1)
+                              .fixedSize(horizontal: true, vertical: false)
+                      } else if isStale {
+                          Text("⚠️ \(formatTimeHM(lastFetched))更新（未更新 \(elapsedSec)秒）")
+                              .font(.system(size: 11, weight: .bold))
+                              .foregroundColor(.red)
+                              .monospacedDigit()
+                              .lineLimit(1)
+                              .fixedSize(horizontal: true, vertical: false)
+                      } else {
+                          Text("● \(formatTimeHM(lastFetched))更新済（次あと\(max(0, 60 - elapsedSec))秒）")
+                              .font(.system(size: 11, weight: .bold))
+                              .foregroundColor(.green)
+                              .monospacedDigit()
+                              .lineLimit(1)
+                              .fixedSize(horizontal: true, vertical: false)
+                      }
+                  }
+                  .padding(.horizontal, 12)
+                  .padding(.vertical, 8)
+                  .background(isStale ? Color.red.opacity(0.16) : Color(white: 0.12))
+                  .cornerRadius(10)
+              }
+
+              private var quickControlBar: some View {
+                  ScrollView(.horizontal, showsIndicators: false) {
+                      HStack(spacing: 8) {
+                          Button {
+                              smartSortEnabled.toggle()
+                              RouteStore.shared.isSmartSortEnabled = smartSortEnabled
+                              favorites = RouteStore.shared.loadFavorites()
+                          } label: {
+                              HStack(spacing: 4) {
+                                  Image(systemName: "arrow.up.arrow.down.circle.fill")
+                                  Text(smartSortEnabled ? "朝夕自動入替: ON" : "朝夕自動入替: OFF")
+                              }
+                              .font(.system(size: 11, weight: .bold))
+                              .padding(.horizontal, 10)
+                              .padding(.vertical, 6)
+                              .background(smartSortEnabled ? Color.indigo.opacity(0.35) : Color(white: 0.15))
+                              .foregroundColor(smartSortEnabled ? Color(red: 0.72, green: 0.72, blue: 1.0) : .gray)
+                              .clipShape(Capsule())
+                          }
+
+                          Button {
+                              keepScreenAwake.toggle()
+                              UIApplication.shared.isIdleTimerDisabled = keepScreenAwake
+                          } label: {
+                              HStack(spacing: 4) {
+                                  Image(systemName: keepScreenAwake ? "sun.max.fill" : "moon.zzz")
+                                  Text(keepScreenAwake ? "スリープ防止: ON" : "スリープ防止: OFF")
+                              }
+                              .font(.system(size: 11, weight: .bold))
+                              .padding(.horizontal, 10)
+                              .padding(.vertical, 6)
+                              .background(keepScreenAwake ? Color.orange.opacity(0.28) : Color(white: 0.15))
+                              .foregroundColor(keepScreenAwake ? .orange : .gray)
+                              .clipShape(Capsule())
+                          }
+
+                          Button {
+                              NotificationManager.shared.sendTestNotification()
+                          } label: {
+                              HStack(spacing: 4) {
+                                  Image(systemName: "bell.badge")
+                                  Text("通知テスト")
+                              }
+                              .font(.system(size: 11, weight: .bold))
+                              .padding(.horizontal, 10)
+                              .padding(.vertical, 6)
+                              .background(Color(white: 0.15))
+                              .foregroundColor(.white)
+                              .clipShape(Capsule())
+                          }
+                      }
+                  }
+              }
+
+              private var searchPanel: some View {
+                  VStack(alignment: .leading, spacing: 10) {
+                      Text("乗るバス停（必須）")
+                          .font(.caption)
+                          .foregroundColor(.gray)
+                      TextField("例：吉川橋、越谷駅東口", text: $searchFrom)
+                          .textFieldStyle(.roundedBorder)
+
+                      Text("降りるバス停（空欄でもOK）")
+                          .font(.caption)
+                          .foregroundColor(.gray)
+                      TextField("例：越谷駅東口", text: $searchTo)
+                          .textFieldStyle(.roundedBorder)
+
+                      Button {
+                          Task { await performSearch(dir: "") }
+                      } label: {
+                          Text(isSearching ? "取得中..." : "このバス停を調べる")
+                              .font(.system(size: 15, weight: .bold))
+                              .frame(maxWidth: .infinity)
+                              .padding(.vertical, 11)
+                              .background(Color.blue)
+                              .foregroundColor(.white)
+                              .cornerRadius(10)
+                      }
+                      .disabled(searchFrom.trimmingCharacters(in: .whitespaces).isEmpty || isSearching)
+
+                      if let sr = searchResult {
+                          if sr.directions.count > 1 {
+                              ScrollView(.horizontal, showsIndicators: false) {
+                                  HStack(spacing: 6) {
+                                      ForEach(sr.directions, id: \.self) { dir in
+                                          Button {
+                                              Task { await performSearch(dir: dir) }
+                                          } label: {
+                                              Text(dir)
+                                                  .font(.caption2.bold())
+                                                  .padding(.horizontal, 10)
+                                                  .padding(.vertical, 6)
+                                                  .background(dir == sr.selectedDir ? Color.blue.opacity(0.3) : Color.gray.opacity(0.2))
+                                                  .foregroundColor(.white)
+                                                  .cornerRadius(8)
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+
+                          let previewRoute = FavoriteRoute(
+                              from: searchFrom.trimmingCharacters(in: .whitespaces),
+                              to: searchTo.trimmingCharacters(in: .whitespaces),
+                              dir: sr.selectedDir,
+                              notifyMinutes: 5
+                          )
+
+                          RouteCardView(
+                              route: previewRoute,
+                              data: sr,
+                              now: now,
+                              canMoveUp: false,
+                              canMoveDown: false,
+                              onMoveUp: {},
+                              onMoveDown: {},
+                              onCycleNotify: {},
+                              actionTitle: "＋ 保存",
+                              actionIsDestructive: false,
+                              onAction: {
+                                  RouteStore.shared.addFavorite(previewRoute)
+                                  favorites = RouteStore.shared.loadFavorites()
+                                  searchResult = nil
+                                  isSearchOpen = false
+                                  Task { await reloadAll() }
+                              }
+                          )
+                      }
+                  }
+                  .padding(14)
+                  .background(Color(white: 0.11))
+                  .cornerRadius(16)
+              }
+
+              private func reloadAll() async {
+                  isLoading = true
+                  var anySuccess = false
+                  let currentList = RouteStore.shared.loadFavorites()
+                  favorites = currentList
+
+                  for fav in currentList {
+                      if let res = try? await BusAPIClient.shared.fetchBus(from: fav.from, to: fav.to, dir: fav.dir) {
+                          results[fav.id] = res
+                          anySuccess = true
+                      }
+                  }
+                  if anySuccess || currentList.isEmpty {
+                      lastFetched = Date()
+                      hasError = false
+                      NotificationManager.shared.scheduleAllUpcomingNotifications(
+                          routes: currentList,
+                          results: results,
+                          isEnabled: notifyEnabled
+                      )
+                  } else {
+                      hasError = true
+                  }
+                  isLoading = false
+              }
+
+              private func performSearch(dir: String) async {
+                  let f = searchFrom.trimmingCharacters(in: .whitespaces)
+                  let t = searchTo.trimmingCharacters(in: .whitespaces)
+                  guard !f.isEmpty else { return }
+                  isSearching = true
+                  searchResult = try? await BusAPIClient.shared.fetchBus(from: f, to: t, dir: dir)
+                  isSearching = false
+              }
+          }
+
+          struct RouteCardView: View {
+              let route: FavoriteRoute
+              let data: BusAPIResponse
+              let now: Date
+              let canMoveUp: Bool
+              let canMoveDown: Bool
+              let onMoveUp: () -> Void
+              let onMoveDown: () -> Void
+              let onCycleNotify: () -> Void
+              let actionTitle: String
+              let actionIsDestructive: Bool
+              let onAction: () -> Void
+
+              @State private var showMore = false
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 10) {
+                      HStack(spacing: 6) {
+                          Text(data.stopName)
+                              .font(.system(size: 14, weight: .heavy))
+                              .foregroundColor(.white)
+                              .lineLimit(1)
+                              .minimumScaleFactor(0.7)
+
+                          Spacer(minLength: 4)
+
+                          if actionIsDestructive {
+                              Button(action: onCycleNotify) {
+                                  Text("🔔\(route.notifyMinutes)分前")
+                                      .font(.system(size: 10, weight: .bold))
+                                      .lineLimit(1)
+                                      .fixedSize(horizontal: true, vertical: false)
+                                      .padding(.horizontal, 7)
+                                      .padding(.vertical, 4)
+                                      .background(Color.yellow.opacity(0.18))
+                                      .foregroundColor(.yellow)
+                                      .clipShape(Capsule())
+                              }
+
+                              if canMoveUp {
+                                  Button(action: onMoveUp) {
+                                      Image(systemName: "arrow.up")
+                                          .font(.system(size: 10, weight: .bold))
+                                          .foregroundColor(.white)
+                                          .frame(width: 24, height: 24)
+                                          .background(Color(white: 0.2))
+                                          .clipShape(Circle())
+                                  }
+                              }
+
+                              if canMoveDown {
+                                  Button(action: onMoveDown) {
+                                      Image(systemName: "arrow.down")
+                                          .font(.system(size: 10, weight: .bold))
+                                          .foregroundColor(.white)
+                                          .frame(width: 24, height: 24)
+                                          .background(Color(white: 0.2))
+                                          .clipShape(Circle())
+                                  }
+                              }
+                          }
+
+                          Button(action: onAction) {
+                              Text(actionTitle)
+                                  .font(.system(size: 10, weight: .bold))
+                                  .lineLimit(1)
+                                  .fixedSize(horizontal: true, vertical: false)
+                                  .padding(.horizontal, 9)
+                                  .padding(.vertical, 5)
+                                  .background(actionIsDestructive ? Color.red.opacity(0.18) : Color.blue)
+                                  .foregroundColor(actionIsDestructive ? .red : .white)
+                                  .clipShape(Capsule())
+                          }
+                      }
+
+                      let primary = data.buses.first ?? data.nextBus
+                      PrimarySlotView(bus: primary, data: data, now: now)
+
+                      if data.buses.count > 1 {
+                          if showMore {
+                              ForEach(Array(data.buses.dropFirst().enumerated()), id: \.offset) { idx, bus in
+                                  SecondarySlotView(order: idx + 2, bus: bus, data: data, now: now)
+                              }
+                          }
+
+                          Button {
+                              withAnimation { showMore.toggle() }
+                          } label: {
+                              Text(showMore ? "▲ 閉じる" : "▼ もう少し後を見る（あと\(data.buses.count - 1)本）")
+                                  .font(.system(size: 12, weight: .bold))
+                                  .foregroundColor(.blue)
+                                  .frame(maxWidth: .infinity)
+                                  .padding(.vertical, 8)
+                                  .background(Color(white: 0.15))
+                                  .cornerRadius(10)
+                          }
+                      }
+                  }
+                  .padding(14)
+                  .background(Color(white: 0.11))
+                  .cornerRadius(18)
+              }
+          }
+
+          struct PrimarySlotView: View {
+              let bus: BusItem
+              let data: BusAPIResponse
+              let now: Date
+
+              var body: some View {
+                  let linkStr = bus.isLive ? data.naviUrl : (data.timetableUrl ?? data.detailUrl)
+                  let content = VStack(alignment: .leading, spacing: 8) {
+                      HStack(spacing: 6) {
+                          Text(bus.isLive ? "🚌 朝日バスナビから取得" : "📅 時刻表から取得")
+                              .font(.system(size: 10, weight: .heavy))
+                              .lineLimit(1)
+                              .fixedSize(horizontal: true, vertical: false)
+                              .padding(.horizontal, 7)
+                              .padding(.vertical, 3)
+                              .background(bus.isLive ? Color.blue.opacity(0.25) : Color.white.opacity(0.1))
+                              .foregroundColor(bus.isLive ? Color(red: 0.4, green: 0.72, blue: 1.0) : .gray)
+                              .cornerRadius(6)
+
+                          Spacer(minLength: 4)
+
+                          Text(bus.stopsAwayText)
+                              .font(.system(size: 11, weight: .bold))
+                              .lineLimit(1)
+                              .minimumScaleFactor(0.8)
+                              .padding(.horizontal, 8)
+                              .padding(.vertical, 3)
+                              .background(bus.isLive ? Color.indigo.opacity(0.38) : Color.white.opacity(0.1))
+                              .foregroundColor(.white)
+                              .clipShape(Capsule())
+                      }
+
+                      HStack(alignment: .bottom, spacing: 8) {
+                          VStack(alignment: .leading, spacing: 2) {
+                              Text(bus.isLive ? "予測時刻" : "定刻ダイヤ")
+                                  .font(.system(size: 10, weight: .bold))
+                                  .foregroundColor(.gray)
+                              Text(bus.predictedTime)
+                                  .font(.system(size: 32, weight: .black, design: .rounded))
+                                  .foregroundColor(bus.isDelayed ? .orange : .white)
+                                  .lineLimit(1)
+                                  .fixedSize(horizontal: true, vertical: false)
+                          }
+
+                          if bus.isLive {
+                              if bus.isDelayed {
+                                  VStack(alignment: .leading, spacing: 2) {
+                                      Text("予定 \(bus.scheduledTime)")
+                                          .font(.system(size: 10))
+                                          .strikethrough()
+                                          .foregroundColor(.gray)
+                                          .lineLimit(1)
+                                          .fixedSize(horizontal: true, vertical: false)
+                                      Text("+\(bus.delayMinutes)分遅れ")
+                                          .font(.system(size: 10, weight: .heavy))
+                                          .lineLimit(1)
+                                          .fixedSize(horizontal: true, vertical: false)
+                                          .padding(.horizontal, 5)
+                                          .padding(.vertical, 2)
+                                          .background(Color.orange)
+                                          .foregroundColor(.black)
+                                          .cornerRadius(5)
+                                  }
+                              } else {
+                                  Text("● 定刻通り")
+                                      .font(.system(size: 10, weight: .heavy))
+                                      .foregroundColor(.green)
+                                      .lineLimit(1)
+                                      .fixedSize(horizontal: true, vertical: false)
+                                      .padding(.bottom, 5)
+                              }
+                          }
+
+                          Spacer(minLength: 2)
+
+                          if let target = bus.targetDate(now: now) {
+                              VStack(alignment: .trailing, spacing: 2) {
+                                  Text("あと")
+                                      .font(.system(size: 10))
+                                      .foregroundColor(.gray)
+                                  Text(formatCountdown(to: target, from: now))
+                                      .font(.system(size: 15, weight: .black))
+                                      .foregroundColor(.red)
+                                      .monospacedDigit()
+                                      .lineLimit(1)
+                                      .fixedSize(horizontal: true, vertical: false)
+                              }
+                          }
+                      }
+                  }
+                  .padding(12)
+                  .background(bus.isDelayed ? Color.orange.opacity(0.15) : (bus.isLive ? Color.blue.opacity(0.15) : Color(white: 0.15)))
+                  .cornerRadius(14)
+
+                  if let url = URL(string: linkStr) {
+                      Link(destination: url) { content }
+                  } else {
+                      content
+                  }
+              }
+          }
+
+          struct SecondarySlotView: View {
+              let order: Int
+              let bus: BusItem
+              let data: BusAPIResponse
+              let now: Date
+
+              var body: some View {
+                  let linkStr = bus.isLive ? data.naviUrl : (data.timetableUrl ?? data.detailUrl)
+                  let row = HStack(spacing: 6) {
+                      Text(order == 2 ? "次の便" : "\(order)本目")
+                          .font(.system(size: 10, weight: .bold))
+                          .lineLimit(1)
+                          .fixedSize(horizontal: true, vertical: false)
+                          .padding(.horizontal, 6)
+                          .padding(.vertical, 2)
+                          .background(bus.isLive ? Color.blue.opacity(0.22) : Color.white.opacity(0.08))
+                          .foregroundColor(bus.isLive ? .blue : .gray)
+                          .cornerRadius(4)
+
+                      Text(bus.predictedTime)
+                          .font(.system(size: 15, weight: .heavy))
+                          .foregroundColor(bus.isDelayed ? .orange : .white)
+                          .lineLimit(1)
+                          .fixedSize(horizontal: true, vertical: false)
+
+                      Text(bus.isLive ? "朝日バスナビ (\(bus.stopsAwayText))" : "時刻表から取得")
+                          .font(.system(size: 10, weight: .semibold))
+                          .foregroundColor(bus.isLive ? Color(red: 0.4, green: 0.72, blue: 1.0) : .gray)
+                          .lineLimit(1)
+
+                      Spacer(minLength: 4)
+
+                      if let target = bus.targetDate(now: now) {
+                          Text(formatCountdown(to: target, from: now))
+                              .font(.system(size: 12, weight: .bold))
+                              .foregroundColor(.orange)
+                              .monospacedDigit()
+                              .lineLimit(1)
+                              .fixedSize(horizontal: true, vertical: false)
+                      }
+                  }
+                  .padding(.horizontal, 10)
+                  .padding(.vertical, 8)
+                  .background(Color(white: 0.14))
+                  .cornerRadius(10)
+
+                  if let url = URL(string: linkStr) {
+                      Link(destination: url) { row }
+                  } else {
+                      row
+                  }
+              }
+          }
+
+          struct ProgressCardView: View {
+              let title: String
+              var body: some View {
+                  HStack {
+                      ProgressView()
+                      Text(title).font(.subheadline).foregroundColor(.gray)
+                  }
+                  .frame(maxWidth: .infinity)
+                  .padding(20)
+                  .background(Color(white: 0.11))
+                  .cornerRadius(16)
+              }
+          }
+
+          func formatCountdown(to target: Date, from now: Date) -> String {
+              let diff = Int(target.timeIntervalSince(now))
+              if diff <= 0 { return "まもなく" }
+              if diff >= 3600 {
+                  return "\(diff / 3600)時間\((diff % 3600) / 60)分"
+              }
+              return String(format: "%d分%02d秒", diff / 60, diff % 60)
+          }
+
+          func formatTimeHMS(_ date: Date) -> String {
+              let f = DateFormatter()
+              f.dateFormat = "HH:mm:ss"
+              return f.string(from: date)
+          }
+
+          func formatTimeHM(_ date: Date) -> String {
+              let f = DateFormatter()
+              f.dateFormat = "HH:mm"
+              return f.string(from: date)
+          }
+          EOF
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build Unsigned App
+        run: |
+          xcodebuild build \
+            -project AsahiBusNavi.xcodeproj \
+            -scheme AsahiBusNavi \
+            -configuration Release \
+            -sdk iphoneos \
+            SYMROOT=$(pwd)/build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Package IPA
+        run: |
+          mkdir -p build/Payload
+          cp -r build/Release-iphoneos/AsahiBusNavi.app build/Payload/
+          cd build
+          zip -r AsahiBusNavi.ipa Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AsahiBusNavi-IPA
+          path: build/AsahiBusNavi.ipa
